@@ -1,984 +1,284 @@
 import {
+    spawn,
+    spawnSync,
+} from "child_process";
+import {
+    Dialog,
+    fetchSyncPost,
     Plugin,
     showMessage,
-    confirm,
-    Dialog,
-    Menu,
-    openTab,
-    adaptHotkey,
-    getFrontend,
-    getBackend,
-    Setting,
-    fetchPost,
-    Protyle,
-    openWindow,
-    IOperation,
-    Constants,
-    openMobileFileById,
-    lockScreen,
-    ICard,
-    ICardData,
-    Custom,
-    exitSiYuan,
-    getModelByDockType,
-    getAllEditor,
-    Files,
-    platformUtils,
-    openSetting,
-    openAttributePanel,
-    saveLayout,
-    IMenuItem,
-    IKernelPluginState,
-    IKernelPluginRpcCall,
 } from "siyuan";
 import "./index.scss";
+import pythonExporter from "../python/siyuan_export/core.py";
 
-const STORAGE_NAME = "menu-config";
-const TAB_TYPE = "custom_tab";
-const DOCK_TYPE = "dock_tab";
+const DATA_KEY = "siyuan-export-config";
+const DEFAULT_PYTHON_COMMAND = process.platform === "win32" ?
+    "py" :
+    process.platform === "darwin" ?
+    "/usr/bin/python3" :
+    "python3";
+const ASSET_LINK_RE = /\]\((assets\/[^)]+)\)/g;
 
-export default class PluginSample extends Plugin {
-    private custom: () => Custom;
-    private isMobile: boolean;
-    private blockIconEventBindThis = this.blockIconEvent.bind(this);
+interface ExportSettings {
+    pythonCommand: string;
+    outDir: string;
+}
+interface CommandProbe {
+    command: string;
+    available: boolean;
+    output: string;
+}
+interface DocRow {
+    id: string;
+    box: string;
+    hpath: string;
+}
+interface ExportDocument {
+    id: string;
+    hpath: string;
+    notebookName: string;
+    markdown: string;
+}
+interface ExportAsset {
+    path: string;
+    base64: string;
+}
+interface ApiResponse<T> {
+    code: number;
+    msg: string;
+    data: T;
+}
 
-    updateProtyleToolbar(toolbar: Array<string | IMenuItem>) {
-        toolbar.push("|");
-        toolbar.push({
-            name: "insert-smail-emoji",
-            icon: "iconEmoji",
-            hotkey: "⇧⌘I",
-            tipPosition: "n",
-            tip: this.i18n.insertEmoji,
-            click(protyle: Protyle) {
-                protyle.insert("😊");
-            },
-        });
-        return toolbar;
+const DEFAULT_SETTINGS: ExportSettings = {pythonCommand: "", outDir: ""};
+
+function escapeHtml(text: string): string {
+    return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\"/g, "&quot;").replace(
+        /'/g,
+        "&#39;",
+    );
+}
+function appendLog(textarea: HTMLTextAreaElement, text: string): void {
+    textarea.value += text;
+    textarea.scrollTop = textarea.scrollHeight;
+}
+function query<T extends Element>(root: ParentNode, selector: string): T {
+    const element = root.querySelector<T>(selector);
+    if (!element) throw new Error(`Missing dialog element: ${selector}`);
+    return element;
+}
+function toBase64(buffer: ArrayBuffer): string {
+    const bytes = new Uint8Array(buffer);
+    let binary = "";
+    for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+        binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+    }
+    return btoa(binary);
+}
+function apiData<T>(response: unknown): T {
+    const payload = response as ApiResponse<T>;
+    if (!payload || payload.code !== 0) throw new Error(payload?.msg || "SiYuan API request failed");
+    return payload.data;
+}
+
+export default class SiyuanExportPlugin extends Plugin {
+    private dialog: Dialog | null = null;
+    private config: ExportSettings = {...DEFAULT_SETTINGS};
+    private probeTimer: ReturnType<typeof setTimeout> | null = null;
+    private commandProbe: CommandProbe = {command: "", available: false, output: ""};
+
+    async onload(): Promise<void> {
+        const stored = await this.loadData(DATA_KEY).catch((): null => null) as Partial<ExportSettings> | null;
+        this.config = {...DEFAULT_SETTINGS, ...stored};
+        this.addIcons(
+            '<symbol id="iconNotebookExport" viewBox="0 0 32 32"><path d="M6 4h14a2 2 0 0 1 2 2v20a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zm2 5v2h10V9H8zm0 5v2h10v-2H8zm0 5v2h7v-2H8z"></path><path d="M24 10v4h-3l5 6 5-6h-3v-4h-4z"></path></symbol>',
+        );
+        this.addCommand({langKey: "openExportDialog", hotkey: "⇧⌘E", callback: () => this.openDialog()});
     }
 
-    onload() {
-        this.kernel.rpc.bind("unload", this.onKernelPluginUnload);
-        this.kernel.rpc.bind("notify", this.onKernelPluginNotify);
-        this.eventBus.on("kernel-plugin-state-change", this.onKernelPluginStateChange);
-
-        this.data[STORAGE_NAME] = {readonlyText: "Readonly"};
-
-        const frontEnd = getFrontend();
-        this.isMobile = frontEnd === "mobile" || frontEnd === "browser-mobile";
-        // 图标的制作参见帮助文档
-        this.addIcons(`<symbol id="iconFace" viewBox="0 0 32 32">
-<path d="M13.667 17.333c0 0.92-0.747 1.667-1.667 1.667s-1.667-0.747-1.667-1.667 0.747-1.667 1.667-1.667 1.667 0.747 1.667 1.667zM20 15.667c-0.92 0-1.667 0.747-1.667 1.667s0.747 1.667 1.667 1.667 1.667-0.747 1.667-1.667-0.747-1.667-1.667-1.667zM29.333 16c0 7.36-5.973 13.333-13.333 13.333s-13.333-5.973-13.333-13.333 5.973-13.333 13.333-13.333 13.333 5.973 13.333 13.333zM14.213 5.493c1.867 3.093 5.253 5.173 9.12 5.173 0.613 0 1.213-0.067 1.787-0.16-1.867-3.093-5.253-5.173-9.12-5.173-0.613 0-1.213 0.067-1.787 0.16zM5.893 12.627c2.28-1.293 4.040-3.4 4.88-5.92-2.28 1.293-4.040 3.4-4.88 5.92zM26.667 16c0-1.040-0.16-2.040-0.44-2.987-0.933 0.2-1.893 0.32-2.893 0.32-4.173 0-7.893-1.92-10.347-4.92-1.4 3.413-4.187 6.093-7.653 7.4 0.013 0.053 0 0.12 0 0.187 0 5.88 4.787 10.667 10.667 10.667s10.667-4.787 10.667-10.667z"></path>
-</symbol>
-<symbol id="iconSaving" viewBox="0 0 32 32">
-<path d="M20 13.333c0-0.733 0.6-1.333 1.333-1.333s1.333 0.6 1.333 1.333c0 0.733-0.6 1.333-1.333 1.333s-1.333-0.6-1.333-1.333zM10.667 12h6.667v-2.667h-6.667v2.667zM29.333 10v9.293l-3.76 1.253-2.24 7.453h-7.333v-2.667h-2.667v2.667h-7.333c0 0-3.333-11.28-3.333-15.333s3.28-7.333 7.333-7.333h6.667c1.213-1.613 3.147-2.667 5.333-2.667 1.107 0 2 0.893 2 2 0 0.28-0.053 0.533-0.16 0.773-0.187 0.453-0.347 0.973-0.427 1.533l3.027 3.027h2.893zM26.667 12.667h-1.333l-4.667-4.667c0-0.867 0.12-1.72 0.347-2.547-1.293 0.333-2.347 1.293-2.787 2.547h-8.227c-2.573 0-4.667 2.093-4.667 4.667 0 2.507 1.627 8.867 2.68 12.667h2.653v-2.667h8v2.667h2.68l2.067-6.867 3.253-1.093v-4.707z"></path>
-</symbol>`);
-
-        this.custom = this.addTab({
-            type: TAB_TYPE,
-            init() {
-                this.element.innerHTML = `<div class="plugin-sample__custom-tab">${this.data.text}</div>`;
-            },
-            beforeDestroy() {
-                console.log("before destroy tab:", TAB_TYPE);
-            },
-            destroy() {
-                console.log("destroy tab:", TAB_TYPE);
-            },
-        });
-
-        this.addCommand({
-            langKey: "showDialog",
-            hotkey: "⇧⌘O",
-            callback: () => {
-                this.showDialog();
-            },
-        });
-
-        this.addCommand({
-            langKey: "getTab",
-            hotkey: "⇧⌘M",
-            globalCallback: () => {
-                console.log(this.getOpenedTab());
-            },
-        });
-        this.addDock({
-            config: {
-                position: "LeftBottom",
-                size: {width: 200, height: 0},
-                icon: "iconSaving",
-                title: "Custom Dock",
-                hotkey: "⌥⌘W",
-            },
-            data: {
-                text: "This is my custom dock",
-            },
-            type: DOCK_TYPE,
-            resize() {
-                console.log(DOCK_TYPE + " resize");
-            },
-            update() {
-                console.log(DOCK_TYPE + " update");
-            },
-            init: (dock) => {
-                if (this.isMobile) {
-                    dock.element.innerHTML = `<div class="toolbar toolbar--border toolbar--dark">
-    <svg class="toolbar__icon"><use xlink:href="#iconEmoji"></use></svg>
-        <div class="toolbar__text">Custom Dock</div>
-    </div>
-    <div class="fn__flex-1 plugin-sample__custom-dock">
-        ${dock.data.text}
-    </div>
-</div>`;
-                } else {
-                    dock.element.innerHTML = `<div class="fn__flex-1 fn__flex-column">
-    <div class="block__icons">
-        <div class="block__logo">
-            <svg class="block__logoicon"><use xlink:href="#iconEmoji"></use></svg>Custom Dock
-        </div>
-        <span class="fn__flex-1 fn__space"></span>
-        <span data-type="min" class="block__icon ariaLabel" data-position="north" aria-label="Min ${
-                        adaptHotkey("⌘W")
-                    }"><svg><use xlink:href="#iconMin"></use></svg></span>
-    </div>
-    <div class="fn__flex-1 plugin-sample__custom-dock">
-        ${dock.data.text}
-    </div>
-</div>`;
-                }
-            },
-            destroy() {
-                console.log("destroy dock:", DOCK_TYPE);
-            },
-        });
-
-        const textareaElement = document.createElement("textarea");
-        this.setting = new Setting({
-            confirmCallback: () => {
-                this.saveData(STORAGE_NAME, {readonlyText: textareaElement.value}).catch(e => {
-                    showMessage(`[${this.name}] save data [${STORAGE_NAME}] fail: `, e);
-                });
-            },
-        });
-        this.setting.addItem({
-            title: "Readonly text",
-            direction: "row",
-            description: "Open plugin url in browser",
-            createActionElement: () => {
-                textareaElement.className = "b3-text-field fn__block";
-                textareaElement.placeholder = "Readonly text in the menu";
-                textareaElement.value = this.data[STORAGE_NAME].readonlyText;
-                return textareaElement;
-            },
-        });
-        const btnaElement = document.createElement("button");
-        btnaElement.className = "b3-button b3-button--outline fn__flex-center fn__size200";
-        btnaElement.textContent = "Open";
-        btnaElement.addEventListener("click", () => {
-            window.open("https://github.com/siyuan-note/plugin-sample");
-        });
-        this.setting.addItem({
-            title: "Open plugin url",
-            description: "Open plugin url in browser",
-            actionElement: btnaElement,
-        });
-
-        this.protyleSlash = [{
-            filter: ["insert emoji 😊", "插入表情 😊", "crbqwx"],
-            html:
-                `<div class="b3-list-item__first"><span class="b3-list-item__text">${this.i18n.insertEmoji}</span><span class="b3-list-item__meta">😊</span></div>`,
-            id: "insertEmoji",
-            callback(protyle: Protyle) {
-                protyle.insert("😊");
-            },
-        }];
-
-        this.protyleOptions = {
-            toolbar: [
-                "block-ref",
-                "a",
-                "|",
-                "text",
-                "strong",
-                "em",
-                "u",
-                "s",
-                "mark",
-                "sup",
-                "sub",
-                "clear",
-                "|",
-                "code",
-                "kbd",
-                "tag",
-                "inline-math",
-                "inline-memo",
-            ],
-        };
-
-        console.log(this.i18n.helloPlugin);
-    }
-
-    onLayoutReady() {
-        const topBarElement = this.addTopBar({
-            icon: "iconFace",
-            title: this.i18n.addTopBarIcon,
+    onLayoutReady(): void {
+        this.addTopBar({
+            icon: "iconNotebookExport",
+            title: this.text("openExportDialog"),
             position: "right",
-            callback: () => {
-                if (this.isMobile) {
-                    this.addMenu();
-                } else {
-                    let rect = topBarElement.getBoundingClientRect();
-                    // 如果被隐藏，则使用更多按钮
-                    if (rect.width === 0) {
-                        rect = document.querySelector("#barMore").getBoundingClientRect();
-                    }
-                    if (rect.width === 0) {
-                        rect = document.querySelector("#barPlugins").getBoundingClientRect();
-                    }
-                    this.addMenu(rect);
-                }
-            },
+            callback: () => this.openDialog(),
         });
-        const statusIconTemp = document.createElement("template");
-        statusIconTemp.innerHTML = `<div class="toolbar__item ariaLabel" aria-label="Remove plugin-sample Data">
-    <svg>
-        <use xlink:href="#iconTrashcan"></use>
-    </svg>
-</div>`;
-        statusIconTemp.content.firstElementChild.addEventListener("click", () => {
-            confirm("⚠️", this.i18n.confirmRemove.replace("${name}", this.name), () => {
-                this.removeData(STORAGE_NAME).then(() => {
-                    this.data[STORAGE_NAME] = {readonlyText: "Readonly"};
-                    showMessage(`[${this.name}]: ${this.i18n.removedData}`);
-                }).catch(e => {
-                    showMessage(`[${this.name}] remove data [${STORAGE_NAME}] fail: `, e);
-                });
+    }
+    onunload(): void {
+        if (this.probeTimer) clearTimeout(this.probeTimer);
+        this.dialog?.destroy();
+        this.dialog = null;
+    }
+    uninstall(): void {
+        this.removeData(DATA_KEY).catch((): void => undefined);
+    }
+
+    private text(key: string): string {
+        return (this.i18n as Record<string, string>)[key] ?? key;
+    }
+    private runtime(value: string): {command: string; args: string[];} {
+        const command = value.trim() || DEFAULT_PYTHON_COMMAND;
+        return {command, args: process.platform === "win32" && command.toLowerCase() === "py" ? ["-3"] : []};
+    }
+    private probe(value: string): CommandProbe {
+        const runtime = this.runtime(value);
+        const result = spawnSync(runtime.command, [...runtime.args, "--version"], {
+            encoding: "utf8",
+            windowsHide: true,
+        });
+        const available = !result.error && result.status === 0;
+        return {
+            command: runtime.command,
+            available,
+            output: `${result.stdout ?? ""}${result.stderr ?? ""}`.trim() ||
+                this.text(available ? "commandReady" : "commandMissing"),
+        };
+    }
+    private html(): string {
+        return `<div class="siyuan-export-plugin"><section class="siyuan-export-plugin__card"><label class="siyuan-export-plugin__field"><span class="siyuan-export-plugin__field-label"><span>${
+            escapeHtml(this.text("pythonRuntime"))
+        }</span><span class="siyuan-export-plugin__hint" data-role="hint"></span><span class="siyuan-export-plugin__actions"><button class="b3-button b3-button--outline" data-action="save">${
+            escapeHtml(this.text("saveSettings"))
+        }</button><button class="b3-button b3-button--text" data-action="export">${
+            escapeHtml(this.text("exportNow"))
+        }</button></span></span><input data-field="python" type="text" placeholder="${
+            escapeHtml(this.text("pythonPlaceholder"))
+        }"></label><label class="siyuan-export-plugin__field"><span class="siyuan-export-plugin__field-label">${
+            escapeHtml(this.text("outDir"))
+        }</span><input data-field="out" type="text" placeholder="/path/to/export"></label></section><section class="siyuan-export-plugin__card siyuan-export-plugin__card--log"><h2>${
+            escapeHtml(this.text("logTitle"))
+        }</h2><textarea class="siyuan-export-plugin__log" data-role="log" readonly></textarea></section></div>`;
+    }
+    private openDialog(): void {
+        this.dialog?.destroy();
+        this.dialog = new Dialog({
+            title: this.text("title"),
+            content: '<div class="siyuan-export-plugin__dialog-host"></div>',
+            width: "780px",
+            height: "620px",
+        });
+        const root = query<HTMLElement>(this.dialog.element, ".siyuan-export-plugin__dialog-host");
+        root.innerHTML = this.html();
+        const python = query<HTMLInputElement>(root, '[data-field="python"]');
+        const out = query<HTMLInputElement>(root, '[data-field="out"]');
+        const hint = query<HTMLElement>(root, '[data-role="hint"]');
+        const log = query<HTMLTextAreaElement>(root, '[data-role="log"]');
+        const exportButton = query<HTMLButtonElement>(root, '[data-action="export"]');
+        python.value = this.config.pythonCommand;
+        out.value = this.config.outDir;
+        const refresh = (): void => {
+            this.commandProbe = this.probe(python.value);
+            hint.textContent = `(${
+                this.commandProbe.available ? this.text("commandReady") : this.text("commandMissingHint")
+            } · ${this.commandProbe.output})`;
+            exportButton.disabled = !this.commandProbe.available || !out.value.trim();
+        };
+        python.addEventListener("input", () => {
+            if (this.probeTimer) clearTimeout(this.probeTimer);
+            this.probeTimer = setTimeout(refresh, 250);
+        });
+        out.addEventListener("input", refresh);
+        refresh();
+        query<HTMLButtonElement>(root, '[data-action="save"]').addEventListener(
+            "click",
+            () => this.save({pythonCommand: python.value.trim(), outDir: out.value.trim()}),
+        );
+        exportButton.addEventListener(
+            "click",
+            () =>
+                this.export(
+                    {pythonCommand: python.value.trim(), outDir: out.value.trim()},
+                    log,
+                    exportButton,
+                    refresh,
+                ),
+        );
+    }
+    private async save(config: ExportSettings): Promise<void> {
+        this.config = config;
+        await this.saveData(DATA_KEY, config);
+        showMessage(this.text("statusSaved"));
+    }
+    private async apiPayload(log: HTMLTextAreaElement): Promise<{documents: ExportDocument[]; assets: ExportAsset[];}> {
+        const rows = apiData<DocRow[]>(
+            await fetchSyncPost("/api/query/sql", {
+                stmt: "SELECT id, box, hpath FROM blocks WHERE type = 'd' ORDER BY box, hpath",
+            }),
+        );
+        const notebooks = apiData<{
+            notebooks?: Array<{id: string; name: string;}>;
+        }>(await fetchSyncPost("/api/notebook/lsNotebooks", {}));
+        const names = new Map((notebooks.notebooks ?? []).map(item => [item.id, item.name]));
+        const assets = new Set<string>();
+        const documents: ExportDocument[] = [];
+        for (const row of rows) {
+            const data = apiData<{
+                hPath: string;
+                content: string;
+            }>(await fetchSyncPost("/api/export/exportMdContent", {id: row.id}));
+            let match: RegExpExecArray | null;
+            while ((match = ASSET_LINK_RE.exec(data.content)) !== null) assets.add(match[1]);
+            ASSET_LINK_RE.lastIndex = 0;
+            documents.push({
+                id: row.id,
+                hpath: data.hPath || row.hpath,
+                notebookName: names.get(row.box) ?? row.box,
+                markdown: data.content,
             });
-        });
-        this.addStatusBar({
-            element: statusIconTemp.content.firstElementChild as HTMLElement,
-        });
-        this.loadData(STORAGE_NAME).catch(e => {
-            console.log(`[${this.name}] load data [${STORAGE_NAME}] fail: `, e);
-        });
-        console.log(`frontend: ${getFrontend()}; backend: ${getBackend()}`);
-    }
-
-    onunload() {
-        console.log(this.i18n.byePlugin);
-
-        this.kernel.rpc.unbind("unload", this.onKernelPluginUnload);
-        this.kernel.rpc.unbind("notify", this.onKernelPluginNotify);
-        this.eventBus.off("kernel-plugin-state-change", this.onKernelPluginStateChange);
-    }
-
-    uninstall() {
-        // 卸载插件时删除插件数据
-        // Delete plugin data when uninstalling the plugin
-        this.removeData(STORAGE_NAME).catch(e => {
-            showMessage(`uninstall [${this.name}] remove data [${STORAGE_NAME}] fail: ${e.msg}`);
-        });
-    }
-
-    // 使用 saveData() 存储的数据发生变更时触发，注释掉则自动禁用插件再重新启用
-    // Triggered when data stored using saveData() changes. If commented out, the plugin will be automatically disabled and then re-enabled.
-    // onDataChanged() {
-    //     console.log("onDataChanged");
-    // }
-
-    async updateCards(options: ICardData) {
-        options.cards.sort((a: ICard, b: ICard) => {
-            if (a.blockID < b.blockID) {
-                return -1;
-            }
-            if (a.blockID > b.blockID) {
-                return 1;
-            }
-            return 0;
-        });
-        return options;
-    }
-
-    /* 自定义设置
-    openSetting() {
-        const dialog = new Dialog({
-            title: this.name,
-            content: `<div class="b3-dialog__content"><textarea class="b3-text-field fn__block" placeholder="readonly text in the menu"></textarea></div>
-<div class="b3-dialog__action">
-    <button class="b3-button b3-button--cancel">${this.i18n.cancel}</button><div class="fn__space"></div>
-    <button class="b3-button b3-button--text">${this.i18n.save}</button>
-</div>`,
-            width: this.isMobile ? "92vw" : "520px",
-        });
-        const inputElement = dialog.element.querySelector("textarea");
-        inputElement.value = this.data[STORAGE_NAME].readonlyText;
-        const btnsElement = dialog.element.querySelectorAll(".b3-button");
-        dialog.bindInput(inputElement, () => {
-            (btnsElement[1] as HTMLButtonElement).click();
-        });
-        inputElement.focus();
-        btnsElement[0].addEventListener("click", () => {
-            dialog.destroy();
-        });
-        btnsElement[1].addEventListener("click", () => {
-            this.saveData(STORAGE_NAME, {readonlyText: inputElement.value});
-            dialog.destroy();
-        });
-    }
-    */
-
-    private readonly eventBusPaste = (event: any) => {
-        // 如果需异步处理请调用 preventDefault， 否则会进行默认处理
-        event.preventDefault();
-        // 如果使用了 preventDefault，必须调用 resolve，否则程序会卡死
-        event.detail.resolve({
-            textPlain: event.detail.textPlain.trim(),
-        });
-    };
-
-    private readonly eventBusLog = ({detail}: any) => {
-        console.log(detail);
-    };
-
-    private readonly onKernelPluginStateChange = async ({detail}: CustomEvent<IKernelPluginState>) => {
-        console.log("kernel-plugin-state-change", detail);
-        switch (detail.code) {
-            case 2: { // running
-                const params = ["param 1", "param 2"];
-                await this.kernel.rpc.notify["echo-notify"](...params);
-
-                const result = await this.kernel.rpc.call.echo(...params);
-                console.group("JSON RPC client -> kernel: call [echo] method");
-                console.log("params:", params);
-                console.log("result:", result);
-                console.groupEnd();
-
-                const request: IKernelPluginRpcCall[] = [
-                    { // call with custom id
-                        id: 0,
-                        method: "echo",
-                        params: {key1: "value1"},
-                    },
-                    { // call with auto-generated id
-                        method: "echo",
-                        params: ["key2", "value2"],
-                    },
-                    { // notify will not have response and id
-                        method: "echo-notify",
-                        params: {key3: "value3"},
-                        notification: true,
-                    },
-                    { // notify will remove id even if it is set
-                        id: "3",
-                        method: "echo-notify",
-                        params: ["key4", "value4"],
-                        notification: true,
-                    },
-                ];
-                const response = await this.kernel.rpc.batch(...request);
-                console.group("JSON RPC client -> kernel: batch call [echo] and [notify] method");
-                console.log("request:", request);
-                console.log("response:", response);
-                console.groupEnd();
-                break;
-            }
+            appendLog(log, `[INFO] exported source: ${row.hpath}\n`);
         }
-    };
-
-    private onKernelPluginUnload = async (...params: any[]) => {
-        console.group("JSON RPC kernel -> client: unload");
-        console.log("params:", params);
-        console.groupEnd();
-    };
-
-    private onKernelPluginNotify = async (...params: any[]) => {
-        console.group("JSON RPC kernel -> client: notify");
-        console.log("params:", params);
-        console.groupEnd();
-    };
-
-    private blockIconEvent({detail}: any) {
-        detail.menu.addItem({
-            id: "pluginSample_removeSpace",
-            iconHTML: "",
-            label: this.i18n.removeSpace,
-            click: () => {
-                const doOperations: IOperation[] = [];
-                detail.blockElements.forEach((item: HTMLElement) => {
-                    const editElement = item.querySelector('[contenteditable="true"]');
-                    if (editElement) {
-                        editElement.textContent = editElement.textContent.replace(/ /g, "");
-                        doOperations.push({
-                            id: item.dataset.nodeId,
-                            data: item.outerHTML,
-                            action: "update",
-                        });
-                    }
-                });
-                detail.protyle.getInstance().transaction(doOperations);
-            },
-        });
-    }
-
-    private showDialog() {
-        const dialog = new Dialog({
-            title: `SiYuan ${Constants.SIYUAN_VERSION}`,
-            content: `<div class="b3-dialog__content">
-    <div>appId:</div>
-    <div class="fn__hr"></div>
-    <div class="plugin-sample__time">${this.app.appId}</div>
-    <div class="fn__hr"></div>
-    <div class="fn__hr"></div>
-    <div>API demo:</div>
-    <div class="fn__hr"></div>
-    <div class="plugin-sample__time">System current time: <span id="time"></span></div>
-    <div class="fn__hr"></div>
-    <div class="fn__hr"></div>
-    <div>Protyle demo:</div>
-    <div class="fn__hr"></div>
-    <div id="protyle" style="height: 360px;"></div>
-</div>`,
-            width: this.isMobile ? "92vw" : "560px",
-            height: "540px",
-        });
-        new Protyle(this.app, dialog.element.querySelector("#protyle"), {
-            blockId: this.getEditor().protyle.block.rootID,
-        });
-        fetchPost("/api/system/currentTime", {}, (response) => {
-            dialog.element.querySelector("#time").innerHTML = new Date(response.data).toString();
-        });
-    }
-
-    private addMenu(rect?: DOMRect) {
-        const menu = new Menu("topBarSample", () => {
-            console.log(this.i18n.byeMenu);
-        });
-        menu.addItem({
-            icon: "iconSettings",
-            label: "Open Setting",
-            click: () => {
-                openSetting(this.app);
-            },
-        });
-        menu.addItem({
-            icon: "iconDrag",
-            label: "Open Attribute Panel",
-            click: () => {
-                openAttributePanel({
-                    nodeElement: this.getEditor().protyle.wysiwyg.element.firstElementChild as HTMLElement,
-                    protyle: this.getEditor().protyle,
-                    focusName: "custom",
-                });
-            },
-        });
-        menu.addItem({
-            icon: "iconInfo",
-            label: "Dialog(open doc first)",
-            accelerator: this.commands[0].customHotkey,
-            click: () => {
-                this.showDialog();
-            },
-        });
-        menu.addItem({
-            icon: "iconFocus",
-            label: "Select Opened Doc(open doc first)",
-            click: () => {
-                (getModelByDockType("file") as Files).selectItem(
-                    this.getEditor().protyle.notebookId,
-                    this.getEditor().protyle.path,
-                );
-            },
-        });
-        if (!this.isMobile) {
-            menu.addItem({
-                icon: "iconFace",
-                label: "Open Custom Tab",
-                click: () => {
-                    const tab = openTab({
-                        app: this.app,
-                        custom: {
-                            icon: "iconFace",
-                            title: "Custom Tab",
-                            data: {
-                                text: platformUtils.isHuawei() ? "Hello, Huawei!" : "This is my custom tab",
-                            },
-                            id: this.name + TAB_TYPE,
-                        },
-                    });
-                    console.log(tab);
-                },
+        const files: ExportAsset[] = [];
+        for (const asset of assets) {
+            const response = await fetch("/api/file/getFile", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({path: `/data/${asset}`}),
             });
-            menu.addItem({
-                icon: "iconImage",
-                label: "Open Asset Tab(First open the Chinese help document)",
-                click: () => {
-                    const tab = openTab({
-                        app: this.app,
-                        asset: {
-                            path: "assets/paragraph-20210512165953-ag1nib4.svg",
-                        },
-                    });
-                    console.log(tab);
-                },
-            });
-            menu.addItem({
-                icon: "iconFile",
-                label: "Open Doc Tab(open doc first)",
-                click: async () => {
-                    const tab = await openTab({
-                        app: this.app,
-                        doc: {
-                            id: this.getEditor().protyle.block.rootID,
-                        },
-                    });
-                    console.log(tab);
-                },
-            });
-            menu.addItem({
-                icon: "iconSearch",
-                label: "Open Search Tab",
-                click: () => {
-                    const tab = openTab({
-                        app: this.app,
-                        search: {
-                            k: "SiYuan",
-                        },
-                    });
-                    console.log(tab);
-                },
-            });
-            menu.addItem({
-                icon: "iconRiffCard",
-                label: "Open Card Tab",
-                click: () => {
-                    const tab = openTab({
-                        app: this.app,
-                        card: {
-                            type: "all",
-                        },
-                    });
-                    console.log(tab);
-                },
-            });
-            menu.addItem({
-                icon: "iconLayout",
-                label: "Open Float Layer(open doc first)",
-                click: () => {
-                    this.addFloatLayer({
-                        refDefs: [{refID: this.getEditor().protyle.block.rootID}],
-                        x: window.innerWidth - 768 - 120,
-                        y: 32,
-                        isBacklink: false,
-                    });
-                },
-            });
-            menu.addItem({
-                icon: "iconOpenWindow",
-                label: "Open Doc Window(open doc first)",
-                click: () => {
-                    openWindow({
-                        doc: {id: this.getEditor().protyle.block.rootID},
-                    });
-                },
-            });
-        } else {
-            menu.addItem({
-                icon: "iconFile",
-                label: "Open Doc(open doc first)",
-                click: () => {
-                    openMobileFileById(this.app, this.getEditor().protyle.block.rootID);
-                },
-            });
+            if (!response.ok) throw new Error(`Unable to read asset: ${asset}`);
+            files.push({path: asset, base64: toBase64(await response.arrayBuffer())});
         }
-        menu.addItem({
-            icon: "iconLock",
-            label: "Lockscreen",
-            click: () => {
-                lockScreen(this.app);
-            },
-        });
-        menu.addItem({
-            icon: "iconQuit",
-            label: "Exit Application",
-            click: () => {
-                exitSiYuan();
-            },
-        });
-        menu.addItem({
-            icon: "iconDownload",
-            label: "Save Layout",
-            click: () => {
-                saveLayout(() => {
-                    showMessage("Layout saved");
-                });
-            },
-        });
-        menu.addItem({
-            icon: "iconScrollHoriz",
-            label: "Event Bus",
-            type: "submenu",
-            submenu: [{
-                icon: "iconSelect",
-                label: "On ws-main",
-                click: () => {
-                    this.eventBus.on("ws-main", this.eventBusLog);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off ws-main",
-                click: () => {
-                    this.eventBus.off("ws-main", this.eventBusLog);
-                },
-            }, {
-                icon: "iconSelect",
-                label: "On click-blockicon",
-                click: () => {
-                    this.eventBus.on("click-blockicon", this.blockIconEventBindThis);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off click-blockicon",
-                click: () => {
-                    this.eventBus.off("click-blockicon", this.blockIconEventBindThis);
-                },
-            }, {
-                icon: "iconSelect",
-                label: "On click-pdf",
-                click: () => {
-                    this.eventBus.on("click-pdf", this.eventBusLog);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off click-pdf",
-                click: () => {
-                    this.eventBus.off("click-pdf", this.eventBusLog);
-                },
-            }, {
-                icon: "iconSelect",
-                label: "On click-editorcontent",
-                click: () => {
-                    this.eventBus.on("click-editorcontent", this.eventBusLog);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off click-editorcontent",
-                click: () => {
-                    this.eventBus.off("click-editorcontent", this.eventBusLog);
-                },
-            }, {
-                icon: "iconSelect",
-                label: "On click-editortitleicon",
-                click: () => {
-                    this.eventBus.on("click-editortitleicon", this.eventBusLog);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off click-editortitleicon",
-                click: () => {
-                    this.eventBus.off("click-editortitleicon", this.eventBusLog);
-                },
-            }, {
-                icon: "iconSelect",
-                label: "On click-flashcard-action",
-                click: () => {
-                    this.eventBus.on("click-flashcard-action", this.eventBusLog);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off click-flashcard-action",
-                click: () => {
-                    this.eventBus.off("click-flashcard-action", this.eventBusLog);
-                },
-            }, {
-                icon: "iconSelect",
-                label: "On open-noneditableblock",
-                click: () => {
-                    this.eventBus.on("open-noneditableblock", this.eventBusLog);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off open-noneditableblock",
-                click: () => {
-                    this.eventBus.off("open-noneditableblock", this.eventBusLog);
-                },
-            }, {
-                icon: "iconSelect",
-                label: "On loaded-protyle-static",
-                click: () => {
-                    this.eventBus.on("loaded-protyle-static", this.eventBusLog);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off loaded-protyle-static",
-                click: () => {
-                    this.eventBus.off("loaded-protyle-static", this.eventBusLog);
-                },
-            }, {
-                icon: "iconSelect",
-                label: "On loaded-protyle-dynamic",
-                click: () => {
-                    this.eventBus.on("loaded-protyle-dynamic", this.eventBusLog);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off loaded-protyle-dynamic",
-                click: () => {
-                    this.eventBus.off("loaded-protyle-dynamic", this.eventBusLog);
-                },
-            }, {
-                icon: "iconSelect",
-                label: "On switch-protyle",
-                click: () => {
-                    this.eventBus.on("switch-protyle", this.eventBusLog);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off switch-protyle",
-                click: () => {
-                    this.eventBus.off("switch-protyle", this.eventBusLog);
-                },
-            }, {
-                icon: "iconSelect",
-                label: "On destroy-protyle",
-                click: () => {
-                    this.eventBus.on("destroy-protyle", this.eventBusLog);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off destroy-protyle",
-                click: () => {
-                    this.eventBus.off("destroy-protyle", this.eventBusLog);
-                },
-            }, {
-                icon: "iconSelect",
-                label: "On open-menu-doctree",
-                click: () => {
-                    this.eventBus.on("open-menu-doctree", this.eventBusLog);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off open-menu-doctree",
-                click: () => {
-                    this.eventBus.off("open-menu-doctree", this.eventBusLog);
-                },
-            }, {
-                icon: "iconSelect",
-                label: "On open-menu-blockref",
-                click: () => {
-                    this.eventBus.on("open-menu-blockref", this.eventBusLog);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off open-menu-blockref",
-                click: () => {
-                    this.eventBus.off("open-menu-blockref", this.eventBusLog);
-                },
-            }, {
-                icon: "iconSelect",
-                label: "On open-menu-fileannotationref",
-                click: () => {
-                    this.eventBus.on("open-menu-fileannotationref", this.eventBusLog);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off open-menu-fileannotationref",
-                click: () => {
-                    this.eventBus.off("open-menu-fileannotationref", this.eventBusLog);
-                },
-            }, {
-                icon: "iconSelect",
-                label: "On open-menu-tag",
-                click: () => {
-                    this.eventBus.on("open-menu-tag", this.eventBusLog);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off open-menu-tag",
-                click: () => {
-                    this.eventBus.off("open-menu-tag", this.eventBusLog);
-                },
-            }, {
-                icon: "iconSelect",
-                label: "On open-menu-link",
-                click: () => {
-                    this.eventBus.on("open-menu-link", this.eventBusLog);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off open-menu-link",
-                click: () => {
-                    this.eventBus.off("open-menu-link", this.eventBusLog);
-                },
-            }, {
-                icon: "iconSelect",
-                label: "On open-menu-image",
-                click: () => {
-                    this.eventBus.on("open-menu-image", this.eventBusLog);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off open-menu-image",
-                click: () => {
-                    this.eventBus.off("open-menu-image", this.eventBusLog);
-                },
-            }, {
-                icon: "iconSelect",
-                label: "On open-menu-av",
-                click: () => {
-                    this.eventBus.on("open-menu-av", this.eventBusLog);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off open-menu-av",
-                click: () => {
-                    this.eventBus.off("open-menu-av", this.eventBusLog);
-                },
-            }, {
-                icon: "iconSelect",
-                label: "On open-menu-content",
-                click: () => {
-                    this.eventBus.on("open-menu-content", this.eventBusLog);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off open-menu-content",
-                click: () => {
-                    this.eventBus.off("open-menu-content", this.eventBusLog);
-                },
-            }, {
-                icon: "iconSelect",
-                label: "On open-menu-breadcrumbmore",
-                click: () => {
-                    this.eventBus.on("open-menu-breadcrumbmore", this.eventBusLog);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off open-menu-breadcrumbmore",
-                click: () => {
-                    this.eventBus.off("open-menu-breadcrumbmore", this.eventBusLog);
-                },
-            }, {
-                icon: "iconSelect",
-                label: "On open-menu-inbox",
-                click: () => {
-                    this.eventBus.on("open-menu-inbox", this.eventBusLog);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off open-menu-inbox",
-                click: () => {
-                    this.eventBus.off("open-menu-inbox", this.eventBusLog);
-                },
-            }, {
-                icon: "iconSelect",
-                label: "On input-search",
-                click: () => {
-                    this.eventBus.on("input-search", this.eventBusLog);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off input-search",
-                click: () => {
-                    this.eventBus.off("input-search", this.eventBusLog);
-                },
-            }, {
-                icon: "iconSelect",
-                label: "On paste",
-                click: () => {
-                    this.eventBus.on("paste", this.eventBusPaste);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off paste",
-                click: () => {
-                    this.eventBus.off("paste", this.eventBusPaste);
-                },
-            }, {
-                icon: "iconSelect",
-                label: "On open-siyuan-url-plugin",
-                click: () => {
-                    this.eventBus.on("open-siyuan-url-plugin", this.eventBusLog);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off open-siyuan-url-plugin",
-                click: () => {
-                    this.eventBus.off("open-siyuan-url-plugin", this.eventBusLog);
-                },
-            }, {
-                icon: "iconSelect",
-                label: "On open-siyuan-url-block",
-                click: () => {
-                    this.eventBus.on("open-siyuan-url-block", this.eventBusLog);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off open-siyuan-url-block",
-                click: () => {
-                    this.eventBus.off("open-siyuan-url-block", this.eventBusLog);
-                },
-            }, {
-                icon: "iconSelect",
-                label: "On opened-notebook",
-                click: () => {
-                    this.eventBus.on("opened-notebook", this.eventBusLog);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off opened-notebook",
-                click: () => {
-                    this.eventBus.off("opened-notebook", this.eventBusLog);
-                },
-            }, {
-                icon: "iconSelect",
-                label: "On closed-notebook",
-                click: () => {
-                    this.eventBus.on("closed-notebook", this.eventBusLog);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off closed-notebook",
-                click: () => {
-                    this.eventBus.off("closed-notebook", this.eventBusLog);
-                },
-            }, {
-                icon: "iconSelect",
-                label: "On kernel-plugin-state-change",
-                click: () => {
-                    this.eventBus.on("kernel-plugin-state-change", this.onKernelPluginStateChange);
-                },
-            }, {
-                icon: "iconClose",
-                label: "Off kernel-plugin-state-change",
-                click: () => {
-                    this.eventBus.off("kernel-plugin-state-change", this.onKernelPluginStateChange);
-                },
-            }],
-        });
-        menu.addSeparator();
-        menu.addItem({
-            icon: "iconSparkles",
-            label: this.data[STORAGE_NAME].readonlyText || "Readonly",
-            type: "readonly",
-        });
-        if (this.isMobile) {
-            menu.fullscreen();
-        } else {
-            menu.open({
-                x: rect.right,
-                y: rect.bottom,
-                isLeft: true,
-            });
-        }
+        return {documents, assets: files};
     }
-
-    private getEditor() {
-        const editors = getAllEditor();
-        if (editors.length === 0) {
-            showMessage("please open doc first");
+    private async export(
+        config: ExportSettings,
+        log: HTMLTextAreaElement,
+        button: HTMLButtonElement,
+        refresh: () => void,
+    ): Promise<void> {
+        if (!config.outDir) {
+            showMessage(this.text("fillRequired"));
             return;
         }
-        return editors[0];
+        const probe = this.probe(config.pythonCommand);
+        if (!probe.available) {
+            showMessage(this.text("commandMissingHint"));
+            return;
+        }
+        try {
+            await this.save(config);
+            button.disabled = true;
+            appendLog(log, "[INFO] Reading documents through the SiYuan API...\n");
+            const payload = await this.apiPayload(log);
+            const runtime = this.runtime(config.pythonCommand);
+            await new Promise<void>((resolve, reject) => {
+                const child = spawn(runtime.command, [...runtime.args, "-u", "-c", pythonExporter, "--api-input"], {
+                    windowsHide: true,
+                });
+                child.stdout.on("data", chunk => appendLog(log, chunk.toString()));
+                child.stderr.on("data", chunk => appendLog(log, chunk.toString()));
+                child.on(
+                    "error",
+                    error => reject(new Error(`Unable to start Python command "${runtime.command}": ${error.message}`)),
+                );
+                child.on("close", code => code === 0 ? resolve() : reject(new Error(`Exporter exited with ${code}`)));
+                child.stdin.end(JSON.stringify({outDir: config.outDir, ...payload}));
+            });
+            showMessage(this.text("statusSuccess"));
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            appendLog(log, `[ERROR] ${message}\n`);
+            showMessage(message);
+        } finally {
+            refresh();
+        }
     }
 }

@@ -1,22 +1,101 @@
-.plugin-sample {
-  &__custom-tab {
-    background-color: var(--b3-theme-background);
-    height: 100%;
-    width: 100%;
-    display: flex;
-    justify-content: center;
-    align-items: center;
-  }
+.siyuan-export-plugin {
+  --sx-accent: #0f766e;
+  --sx-accent-strong: #0b5f58;
+  --sx-border: var(--b3-border-color);
+  --sx-text-dim: color-mix(in srgb, var(--b3-theme-on-background) 66%, transparent);
+  color: var(--b3-theme-on-background);
+}
 
-  &__custom-dock {
-    display: flex;
-    justify-content: center;
-    align-items: center;
-  }
+.siyuan-export-plugin__card {
+  padding: 12px;
+  border: 1px solid var(--sx-border);
+  border-radius: 4px;
+  background: var(--b3-theme-background);
+}
 
-  &__time {
-    background: var(--b3-card-info-background);
-    border-radius: 4px;
-    padding: 2px 8px;
+.siyuan-export-plugin__card + .siyuan-export-plugin__card {
+  margin-top: 12px;
+}
+
+.siyuan-export-plugin__field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.siyuan-export-plugin__field-label,
+.siyuan-export-plugin__card h2 {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.siyuan-export-plugin__field-label {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.siyuan-export-plugin__field + .siyuan-export-plugin__field {
+  margin-top: 20px;
+}
+
+.siyuan-export-plugin__field-label .siyuan-export-plugin__hint {
+  font-weight: 400;
+}
+
+.siyuan-export-plugin__field input,
+.siyuan-export-plugin__log {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--sx-border);
+  border-radius: 4px;
+  background: var(--b3-theme-surface);
+  color: var(--b3-theme-on-background);
+  padding: 8px 10px;
+}
+
+.siyuan-export-plugin__grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.siyuan-export-plugin__hint {
+  color: var(--sx-text-dim);
+  font-size: 12px;
+}
+
+.siyuan-export-plugin__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.siyuan-export-plugin__actions {
+  margin-left: auto;
+}
+
+.siyuan-export-plugin [data-action="export"] {
+  border-color: var(--sx-accent-strong);
+  background: var(--sx-accent);
+  color: #fff;
+}
+
+.siyuan-export-plugin__card h2 {
+  margin: 0 0 8px;
+}
+
+.siyuan-export-plugin__log {
+  min-height: 230px;
+  resize: vertical;
+  font-family: var(--b3-font-family-monospace);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+@media (max-width: 760px) {
+  .siyuan-export-plugin__grid {
+    grid-template-columns: 1fr;
   }
 }

@@ -29,7 +29,7 @@ module.exports = (env, argv) => {
                     {from: "README*.md", to: "./dist/"},
                     {from: "plugin.json", to: "./dist/"},
                     {from: "src/i18n/", to: "./dist/i18n/"},
-                    {from: "dist/kernel.js", to: "./dist/"},
+                    {from: "python/", to: "./dist/python/"},
                 ],
             }),
         );
@@ -62,10 +62,14 @@ module.exports = (env, argv) => {
             libraryTarget: "commonjs2",
             library: {
                 type: "commonjs2",
+                export: "default",
             },
         },
         externals: {
             siyuan: "siyuan",
+            "child_process": "commonjs2 child_process",
+            fs: "commonjs2 fs",
+            path: "commonjs2 path",
         },
         entry: {
             [production ? "dist/index" : "index"]: "./src/index.ts",
@@ -92,6 +96,10 @@ module.exports = (env, argv) => {
                             },
                         },
                     ],
+                },
+                {
+                    test: /\.py$/,
+                    type: "asset/source",
                 },
                 {
                     test: /\.scss$/,
