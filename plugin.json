@@ -2,7 +2,7 @@
   "name": "siyuan-export",
   "author": "yxw",
   "url": "https://github.com/yanxuwei666/siyuan-export",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "minAppVersion": "3.7.0",
   "backends": [
     "windows",

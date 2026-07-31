@@ -50,6 +50,7 @@ interface ApiResponse<T> {
 }
 
 const DEFAULT_SETTINGS: ExportSettings = {pythonCommand: "", outDir: ""};
+const DOCUMENT_QUERY_LIMIT = 128;
 
 function escapeHtml(text: string): string {
     return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\"/g, "&quot;").replace(
@@ -78,6 +79,9 @@ function apiData<T>(response: unknown): T {
     const payload = response as ApiResponse<T>;
     if (!payload || payload.code !== 0) throw new Error(payload?.msg || "SiYuan API request failed");
     return payload.data;
+}
+function sqlString(value: string): string {
+    return `'${value.replace(/'/g, "''")}'`;
 }
 
 export default class SiyuanExportPlugin extends Plugin {
@@ -198,16 +202,38 @@ export default class SiyuanExportPlugin extends Plugin {
         await this.saveData(DATA_KEY, config);
         showMessage(this.text("statusSaved"));
     }
+    private async documentRows(notebookId: string): Promise<DocRow[]> {
+        const rows: DocRow[] = [];
+        let offset = 0;
+        while (true) {
+            const page = apiData<DocRow[]>(
+                await fetchSyncPost("/api/query/sql", {
+                    stmt: `SELECT id, box, hpath FROM blocks WHERE type = 'd' AND box = ${
+                        sqlString(notebookId)
+                    } ORDER BY hpath LIMIT ${DOCUMENT_QUERY_LIMIT} OFFSET ${offset}`,
+                }),
+            );
+            rows.push(...page);
+            if (page.length < DOCUMENT_QUERY_LIMIT) break;
+            offset += page.length;
+        }
+        return rows;
+    }
     private async apiPayload(log: HTMLTextAreaElement): Promise<{documents: ExportDocument[]; assets: ExportAsset[];}> {
-        const rows = apiData<DocRow[]>(
-            await fetchSyncPost("/api/query/sql", {
-                stmt: "SELECT id, box, hpath FROM blocks WHERE type = 'd' ORDER BY box, hpath",
-            }),
-        );
         const notebooks = apiData<{
             notebooks?: Array<{id: string; name: string;}>;
         }>(await fetchSyncPost("/api/notebook/lsNotebooks", {}));
-        const names = new Map((notebooks.notebooks ?? []).map(item => [item.id, item.name]));
+        const notebookItems = notebooks.notebooks ?? [];
+        const names = new Map(notebookItems.map(item => [item.id, item.name]));
+        const rows = (await Promise.all(notebookItems.map(async notebook => this.documentRows(notebook.id)))).reduce(
+            (all, page) => {
+                all.push(...page);
+                return all;
+            },
+            [] as DocRow[],
+        );
+        appendLog(log, `[INFO] notebooks found: ${notebookItems.length}\n`);
+        appendLog(log, `[INFO] documents found: ${rows.length}\n`);
         const assets = new Set<string>();
         const documents: ExportDocument[] = [];
         for (const row of rows) {
